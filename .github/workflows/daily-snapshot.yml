@@ -18,6 +18,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -r requirements.txt
+      - name: Scarica STLFSI4 e l'HICP euro se la chiave c'è
+        run: python mobile/scripts/fetch_fred_series.py
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
       - name: Ricalcola lo snapshot
         run: python mobile/scripts/update_daily.py
         env:
