@@ -22,6 +22,7 @@ jobs:
         run: python mobile/scripts/update_daily.py
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
       - name: Pubblica data/snapshot.json
         run: |
           git config user.email "snapshot-bot@users.noreply.github.com"
