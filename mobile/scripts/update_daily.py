@@ -453,6 +453,13 @@ def main() -> None:
     from data_engine.news_sentiment import sentiment_snapshot
 
     sentiment = sentiment_snapshot()
+    if not sentiment.get("gdelt"):
+        from daily_narrative import gkg_mean_tone
+
+        tone = gkg_mean_tone(as_of)
+        if tone is not None:
+            sentiment["score"] = round(tone, 3)
+            sentiment["gdelt"] = True
     print(f"sentiment score {sentiment.get('score')} gdelt {sentiment.get('gdelt')} titoli {len(sentiment.get('headlines') or [])}")
 
     import csv

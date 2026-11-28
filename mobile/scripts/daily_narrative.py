@@ -43,16 +43,41 @@ MARKETS = (
     ("vix", "VIX", "%5EVIX", "level"),
 )
 
+# Word-boundary patterns. "cpi" must not match the Indian party CPI(M); "brent" must not match Brentwood.
 BUCKETS = (
-    ("intelligenza artificiale", "artificial intelligence", ("nvidia", "artificial intelligence", "semiconductor", "chip ")),
-    ("banche centrali e tassi", "central banks and rates", ("federal reserve", "ecb", "interest rate", "rate hike", "central bank")),
-    ("inflazione", "inflation", ("inflation", "consumer price", "hicp", "cpi")),
-    ("dazi", "tariffs", ("tariff", "duties")),
-    ("petrolio", "oil", ("oil", "brent", "opec", "hormuz")),
-    ("europa", "europe", ("eurozone", "euro area", "stoxx", "european stock")),
-    ("asia", "asia", ("shanghai", "nikkei", "hang seng", "china stock", "beijing")),
-    ("conflitti", "conflict", ("ukraine", "gaza", "war ", "missile")),
+    ("intelligenza artificiale", "artificial intelligence", (r"\bnvidia\b", r"\bartificial intelligence\b", r"\bsemiconductors?\b")),
+    ("banche centrali e tassi", "central banks and rates", (r"\bfederal reserve\b", r"\becb\b", r"\binterest rates?\b", r"\brate hike\b", r"\bcentral banks?\b")),
+    ("inflazione", "inflation", (r"\binflation\b", r"\bconsumer prices?\b", r"\bhicp\b", r"\bcpi\b(?!\s*\()")),
+    ("dazi", "tariffs", (r"\btariffs?\b", r"\bduties\b")),
+    ("petrolio", "oil", (r"\bcrude oil\b", r"\boil prices?\b", r"\bbrent crude\b", r"\bbrent\b(?!wood)", r"\bopec\b", r"\bhormuz\b")),
+    ("europa", "europe", (r"\beurozone\b", r"\beuro area\b", r"\bstoxx\b", r"\beuropean stocks?\b")),
+    ("asia", "asia", (r"\bshanghai\b", r"\bnikkei\b", r"\bhang seng\b", r"\bchina stocks?\b")),
+    ("conflitti", "conflict", (r"\bukraine\b", r"\bgaza\b", r"\bhormuz\b")),
 )
+FINANCE = re.compile(
+    r"\b(stocks?|markets?|shares?|investors?|trading|equit(?:y|ies)|bonds?|yields?|"
+    r"wall street|nasdaq|s&p|fed\b|ecb|central banks?|inflation|tariffs?|crude|opec|"
+    r"oil prices?|oil\b|economy|gdp|dollar|euro|treasury|interest rates?|rate hike)\b",
+    re.I,
+)
+POLITICAL = re.compile(
+    r"cpi\s*\(\s*m\s*\)|\bcpim\b|communist party|\bbjp\b|civic poll|\bpolling\b|\bcandidate\b",
+    re.I,
+)
+PREFERRED_HOSTS = (
+    "reuters.com", "apnews.com", "cnbc.com", "ft.com", "bloomberg.com", "wsj.com",
+    "euronews.com", "aa.com.tr", "marketwatch.com", "investing.com", "finance.yahoo.com",
+    "federalreserve.gov", "ecb.europa.eu", "bbc.com", "bbc.co.uk", "nytimes.com",
+    "theguardian.com", "economist.com", "barrons.com", "foxbusiness.com",
+    "independent.co.uk", "businessinsider.com", "nikkei.com", "finanznachrichten.de",
+    "investinglive.com",
+)
+US_MEASURE = {
+    "CPIAUCSL": ("CPI", "CPI"),
+    "CPILFESL": ("CPI core", "core CPI"),
+    "PCEPI": ("PCE", "PCE"),
+    "PCEPILFE": ("PCE core", "core PCE"),
+}
 
 
 def _get(url: str, timeout: int = 25) -> bytes:
@@ -88,12 +113,36 @@ def _closes(ticker: str) -> list[tuple[str, float]]:
     return [(day, dedup[day]) for day in sorted(dedup)]
 
 
+def _close_on_or_before(rows: list[tuple[str, float]], day: str) -> float | None:
+    earlier = [value for stamp, value in rows if stamp <= day]
+    if not earlier:
+        return None
+    return earlier[-1]
+
+
+def weekly_base(rows: list[tuple[str, float]]) -> float | None:
+    """Close seven calendar days before the last print, or the session just before it.
+
+    Five index steps is the previous Friday only when every weekday traded.
+    A US holiday such as Thanksgiving removes a bar, so those five steps land
+    on Thursday of the week before. Seven calendar days still lands on the
+    Friday a week earlier.
+    """
+    if len(rows) < 2:
+        return None
+    last_day = datetime.strptime(rows[-1][0], "%Y-%m-%d").date()
+    target = (last_day - timedelta(days=7)).isoformat()
+    return _close_on_or_before(rows, target)
+
+
 def _move(rows: list[tuple[str, float]], kind: str) -> dict | None:
     if len(rows) < 2:
         return None
     last_day, last = rows[-1]
     prev = rows[-2][1]
-    week = rows[-6][1] if len(rows) >= 6 else rows[0][1]
+    week = weekly_base(rows)
+    if week is None:
+        return None
     if kind == "yield10":
         # Yahoo's ^TNX is the yield times ten when the print is above 20.
         if last > 20:
@@ -152,8 +201,37 @@ def _gdelt_file(stamp: str) -> list[dict]:
     return articles
 
 
+def _host(url: str) -> str:
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _preferred(url: str) -> bool:
+    host = _host(url)
+    return any(host == name or host.endswith("." + name) for name in PREFERRED_HOSTS)
+
+
+def _theme_key(title: str, url: str) -> tuple[str, str] | None:
+    # The site name is not a keyword: nikkei.com must not make every story an Asia story.
+    path = urllib.parse.urlparse(url).path.replace("-", " ")
+    hay = f"{title} {path}"
+    if POLITICAL.search(hay) or POLITICAL.search(title):
+        return None
+    for key, english, patterns in BUCKETS:
+        if not any(re.search(pattern, hay, flags=re.I) for pattern in patterns):
+            continue
+        # A war headline with no market word is not a market theme. The other
+        # buckets are already finance words, matched on a word boundary.
+        if key == "conflitti" and not FINANCE.search(hay):
+            return None
+        return key, english
+    return None
+
+
 def gdelt_themes(as_of: str | None) -> list[dict]:
-    """Five to eight themes, each with one or two real GDELT links."""
+    """Five to eight market themes. A theme without a major-news link is dropped."""
     day = datetime.strptime((as_of or datetime.now(timezone.utc).date().isoformat())[:10], "%Y-%m-%d")
     stamps = []
     for shift in range(0, 5):
@@ -165,6 +243,7 @@ def gdelt_themes(as_of: str | None) -> list[dict]:
         if len(stamps) >= 6:
             break
     grouped: dict[str, list[dict]] = {key: [] for key, *_rest in BUCKETS}
+    english = {key: label for key, label, _patterns in BUCKETS}
     seen: set[str] = set()
     for stamp in stamps:
         try:
@@ -174,27 +253,68 @@ def gdelt_themes(as_of: str | None) -> list[dict]:
             continue
         print(f"GDELT {stamp} titoli {len(articles)}")
         for article in articles:
-            if article["url"] in seen:
+            if article["url"] in seen or not _preferred(article["url"]):
                 continue
-            hay = f"{article['title']} {article['url']}".lower()
-            for key, _en, words in BUCKETS:
-                if any(word in hay for word in words):
-                    grouped[key].append(article)
-                    seen.add(article["url"])
-                    break
+            matched = _theme_key(article["title"], article["url"])
+            if matched is None:
+                continue
+            key, _label = matched
+            grouped[key].append(article)
+            seen.add(article["url"])
     themes = []
-    for key, english, _words in BUCKETS:
+    for key, _label, _patterns in BUCKETS:
         items = grouped[key][:2]
         if not items:
             continue
         themes.append({
             "theme": key,
-            "theme_en": english,
-            "links": [{"label": item["source"] or item["title"][:40], "url": item["url"], "title": item["title"]} for item in items],
+            "theme_en": english[key],
+            "links": [{"label": item["title"], "url": item["url"], "title": item["title"]} for item in items],
         })
         if len(themes) >= 8:
             break
     return themes[:8]
+
+
+def gkg_mean_tone(day: str) -> float | None:
+    """Average GDELT GKG V2Tone for one weekday. Same scale as the sentiment card."""
+    stamp = day.replace("-", "")[:8] + "154500"
+    url = f"https://data.gdeltproject.org/gdeltv2/{stamp}.gkg.csv.zip"
+    try:
+        blob = _get(url, timeout=45)
+        archive = zipfile.ZipFile(io.BytesIO(blob))
+        text = archive.read(archive.namelist()[0]).decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(f"tono GDELT non disponibile ({type(exc).__name__})")
+        return None
+    total = 0.0
+    count = 0
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 16 or not parts[15]:
+            continue
+        try:
+            total += float(parts[15].split(",")[0])
+        except ValueError:
+            continue
+        count += 1
+    if count == 0:
+        return None
+    tone = total / count
+    print(f"tono GDELT {day} {tone:.3f} n={count}")
+    return tone
+
+
+def news_tone(sentiment: dict, as_of: str | None, fetch: bool) -> float | None:
+    """The card's GDELT average. A lexicon fallback is a different scale and is not used."""
+    if sentiment.get("gdelt") and sentiment.get("score") is not None:
+        return float(sentiment["score"])
+    points = sentiment.get("points") or []
+    if sentiment.get("gdelt") and points and points[-1].get("value") is not None:
+        return float(points[-1]["value"])
+    if fetch and as_of:
+        return gkg_mean_tone(as_of[:10])
+    return None
 
 
 def _num(value) -> list[float]:
@@ -311,16 +431,16 @@ def _market(inputs: dict, key: str) -> dict | None:
 def _theme_docs(inputs: dict, lang: str) -> list[dict]:
     docs = []
     for theme in (inputs.get("themes") or [])[:8]:
+        links = [link for link in theme.get("links") or [] if link.get("url") and (link.get("title") or link.get("label"))]
+        if not links:
+            continue
         name = theme["theme"] if lang == "it" else theme.get("theme_en") or theme["theme"]
-        sentence = (
-            "Un titolo del giorno parla di questo tema. Il link è quello raccolto, senza copiare l'articolo."
-            if lang == "it"
-            else "One of the day's headlines is about this theme. The link is the one collected, without copying the article."
-        )
+        title = links[0].get("title") or links[0].get("label")
+        sentence = f"Su {name}, il titolo è «{title}»." if lang == "it" else f"On {name}, the headline is “{title}”."
         docs.append({
             "theme": name[:1].upper() + name[1:],
             "sentence": sentence,
-            "links": [{"label": link.get("label") or link.get("title") or "fonte", "url": link["url"]} for link in theme.get("links") or [] if link.get("url")],
+            "links": [{"label": link.get("title") or link.get("label"), "url": link["url"]} for link in links[:2]],
         })
     return docs
 
@@ -376,14 +496,34 @@ def template_narrative(inputs: dict) -> dict:
             )
         return ", ".join(bits)
 
+    def _when(row: dict, lang: str) -> str:
+        stamp = (row.get("asOf") or "")[:10]
+        if len(stamp) < 7:
+            return ""
+        month_no = int(stamp[5:7])
+        year_no = stamp[:4]
+        if not 1 <= month_no <= 12:
+            return ""
+        name = months_it[month_no] if lang == "it" else months_en[month_no]
+        return f"{name} {year_no}"
+
     def inflation_line(lang: str) -> str:
         parts = []
         for key, label_it, label_en in (("EZ", "eurozona", "euro area"), ("CH", "Svizzera", "Switzerland"), ("US", "Stati Uniti", "United States")):
             row = inflation.get(key) or {}
+            label = label_it if lang == "it" else label_en
             if row.get("yoy") is None:
-                parts.append(f"{label_it if lang == 'it' else label_en}: dato non ancora pubblicato" if lang == "it" else f"{label_en}: figure not published yet")
+                parts.append(f"{label}: dato non ancora pubblicato" if lang == "it" else f"{label}: figure not published yet")
+                continue
+            figure = _fmt(row["yoy"] * 100.0, 1, lang)
+            when = _when(row, lang)
+            if key == "US":
+                measure = US_MEASURE.get(row.get("series") or "", ("prezzi al consumo", "consumer prices"))
+                measure_name = measure[0] if lang == "it" else measure[1]
+                dated = f" di {when}" if when and lang == "it" else (f" for {when}" if when else "")
+                parts.append(f"{label}, {measure_name}{dated}, {figure}%")
             else:
-                parts.append(f"{label_it if lang == 'it' else label_en} {_fmt(row['yoy'] * 100.0, 1, lang)}%")
+                parts.append(f"{label} {figure}%")
         return ", ".join(parts)
 
     def score_line(lang: str) -> str:
@@ -465,14 +605,14 @@ def template_narrative(inputs: dict) -> dict:
         "it": {
             "title": title_it,
             "cosa_sta_succedendo": it_story,
-            "temi": themes or [{"theme": "Temi", "sentence": "I titoli del giorno non sono ancora raggruppati.", "links": []}],
+            "temi": themes,
             "mercati": markets_it,
             "da_tenere_docchio": watch_it,
         },
         "en": {
             "title": title_en,
             "cosa_sta_succedendo": en_story,
-            "temi": themes_en or [{"theme": "Themes", "sentence": "Today's headlines are not grouped yet.", "links": []}],
+            "temi": themes_en,
             "mercati": markets_en,
             "da_tenere_docchio": watch_en,
         },
@@ -488,8 +628,16 @@ def collect_inputs(snapshot: dict, with_network: bool = True) -> dict:
         "asOf": as_of,
         "regime": {"label": regime.get("label"), "code": regime.get("code"), "plain": regime.get("plain")},
         "pillars": macro.get("pillars") or {},
-        "inflation": {key: {"yoy": (row or {}).get("yoy"), "asOf": (row or {}).get("asOf")} for key, row in (snapshot.get("inflation") or {}).items() if isinstance(row, dict)},
-        "sentiment": {"score": sentiment.get("score"), "previous": sentiment.get("previous")},
+        "inflation": {
+            key: {
+                "yoy": (row or {}).get("yoy"),
+                "asOf": (row or {}).get("asOf"),
+                "series": (row or {}).get("series"),
+            }
+            for key, row in (snapshot.get("inflation") or {}).items()
+            if isinstance(row, dict)
+        },
+        "sentiment": {"score": news_tone(sentiment, as_of, fetch=with_network), "gdelt": True},
         "behavior": snapshot.get("behavior") or {},
         "headlines": [{"title": item.get("title"), "url": item.get("url"), "source": item.get("source")} for item in (sentiment.get("headlines") or [])[:8]],
         "markets": [],
